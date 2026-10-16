@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Team Task Manager</title>
+<style>
+  body{font:15px system-ui,sans-serif;max-width:860px;margin:2rem auto;padding:0 1rem;color:#222}
+  input,select,button{font:inherit;padding:.4rem .6rem;margin:.2rem 0}
+  button{cursor:pointer}
+  table{width:100%;border-collapse:collapse;margin-top:1rem}
+  td,th{border-bottom:1px solid #ddd;padding:.45rem;text-align:left}
+  .row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
+  .err{color:#b00020}.muted{color:#777}
+  .tag{padding:.1rem .45rem;border-radius:4px;background:#eee;font-size:.85em}
+  .critical{background:#ffd6d6}.high{background:#ffe8c7}
+</style>
+</head>
+<body>
+<h1>Team Task Manager</h1>
+<p class="muted">Minimal demo client. The real work is the API &mdash; see README.</p>
+<div id="err" class="err"></div>
+ 
+<section id="auth">
+  <div class="row">
+    <input id="email" placeholder="email" value="asha@example.com">
+    <input id="password" type="password" placeholder="password" value="password123">
+    <button onclick="login()">Log in</button>
+    <button onclick="register()">Register</button>
+  </div>
+  <input id="name" placeholder="name (for register)">
+</section>
+ 
+<section id="app" hidden>
+  <div class="row">
+    <span id="who"></span><button onclick="logout()">Log out</button>
+  </div>
+  <div class="row">
+    <select id="project" onchange="changeProject()"></select>
+    <select id="fStatus" onchange="loadIssues()">
+      <option value="">all statuses</option><option>todo</option><option>in_progress</option><option>in_review</option><option>done</option>
+    </select>
+    <input id="search" placeholder="search..." oninput="loadIssues()">
+  </div>
+  <div class="row">
+    <input id="newTitle" placeholder="New issue title" size="30">
+    <select id="newType"><option>task</option><option>bug</option><option>story</option></select>
+    <select id="newPrio"><option>medium</option><option>low</option><option>high</option><option>critical</option></select>
+    <select id="newAssignee"><option value="">Unassigned</option></select>
+    <button onclick="createIssue()">Add issue</button>
+  </div>
+  <table><thead><tr><th>Key</th><th>Title</th><th>Priority</th><th>Assignee</th><th>Status</th></tr></thead>
+  <tbody id="issues"></tbody></table>
+</section>
+ 
+<script>
+const $ = (id) => document.getElementById(id);
+let token = localStorage.getItem('token');
+let me = null; // the logged-in user, set in start()
+ 
+async function api(path, opts = {}) {
+  const res = await fetch('/api' + path, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', ...(token && { Authorization: 'Bearer ' + token }) },
+    body: opts.body && JSON.stringify(opts.body),
+  });
+  if (res.status === 204) return null;
+  const data = await res.json();
+  if (!res.ok) {
+    const detail = data.details?.map((d) => `${d.path}: ${d.message}`).join('; ');
+    throw new Error(data.error + (detail ? ` (${detail})` : ''));
+  }
+  return data;
+}
+const run = (fn) => async (...a) => { try { $('err').textContent = ''; await fn(...a); } catch (e) { $('err').textContent = e.message; } };
+ 
+async function authenticate(path, body) {
+  const data = await api(path, { method: 'POST', body });
+  token = data.token; localStorage.setItem('token', token);
+  await start();
+}
+const login = run(() => authenticate('/auth/login', { email: $('email').value, password: $('password').value }));
+const register = run(() => authenticate('/auth/register', { name: $('name').value, email: $('email').value, password: $('password').value }));
+function logout() { localStorage.removeItem('token'); token = null; $('app').hidden = true; $('auth').hidden = false; }
+ 
+const start = run(async () => {
+  const { user } = await api('/auth/me');
+  me = user;
+  $('who').textContent = `Signed in as ${user.name} (${user.role})`;
+  $('auth').hidden = true; $('app').hidden = false;
+  const { data } = await api('/projects');
+  $('project').innerHTML = data.map((p) => `<option value="${p.id}">${p.key} - ${p.name}</option>`).join('');
+  await loadMembers();
+  await loadIssues();
+});
+ 
+let members = [];
+const loadMembers = async () => {
+  if (!$('project').value) { members = []; return; }
+  const project = await api(`/projects/${$('project').value}`);
+  members = project.members;
+  $('newAssignee').innerHTML = '<option value="">Unassigned</option>' +
+    members.map((m) => `<option value="${m.id}">${m.name}</option>`).join('');
+  // Default to the logged-in user; admins who aren't members stay on Unassigned.
+  if (me && members.some((m) => m.id === me.id)) $('newAssignee').value = String(me.id);
+};
+const changeProject = run(async () => { await loadMembers(); await loadIssues(); });
+ 
+const loadIssues = run(async () => {
+  if (!$('project').value) { $('issues').innerHTML = '<tr><td colspan=5 class="muted">No projects yet (create one via the API).</td></tr>'; return; }
+  const params = new URLSearchParams({ limit: 50 });
+  if ($('fStatus').value) params.set('status', $('fStatus').value);
+  if ($('search').value) params.set('q', $('search').value);
+  const { data } = await api(`/projects/${$('project').value}/issues?${params}`);
+  const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  $('issues').innerHTML = data.map((i) => `
+    <tr><td>${esc(i.issue_key)}</td><td>${esc(i.title)}</td>
+    <td><span class="tag ${i.priority}">${i.priority}</span></td><td><select onchange="setAssignee(${i.id}, this.value)">
+      <option value="">-</option>
+      ${members.map((m) => `<option value="${m.id}" ${m.id === i.assignee_id ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}
+    </select></td>
+    <td><select onchange="setStatus(${i.id}, this.value)">
+      ${['todo', 'in_progress', 'in_review', 'done'].map((s) => `<option ${s === i.status ? 'selected' : ''}>${s}</option>`).join('')}
+    </select></td></tr>`).join('') || '<tr><td colspan=5 class="muted">No issues.</td></tr>';
+});
+ 
+const setStatus = run(async (id, status) => {
+  try { await api(`/issues/${id}`, { method: 'PATCH', body: { status } }); }
+  finally { await loadIssues(); } // reload so the dropdown reverts if the transition was rejected
+});
+ 
+const setAssignee = run(async (id, value) => {
+  try { await api(`/issues/${id}`, { method: 'PATCH', body: { assignee_id: value ? Number(value) : null } }); }
+  finally { await loadIssues(); }
+});
+ 
+const createIssue = run(async () => {
+  await api(`/projects/${$('project').value}/issues`, { method: 'POST', body: { title: $('newTitle').value, type: $('newType').value, priority: $('newPrio').value, assignee_id: $('newAssignee').value ? Number($('newAssignee').value) : null } });
+  $('newTitle').value = '';
+  await loadIssues();
+});
+ 
+if (token) start();
+</script>
+</body>
+</html>
+ 
